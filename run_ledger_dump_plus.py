@@ -65,6 +65,32 @@ def _to_float(x):
     try: return float(s) if s else 0.0
     except: return 0.0
 
+def _to_bool(x):
+    if isinstance(x, bool):
+        return x
+    if x is None:
+        return False
+    s = str(x).strip().lower()
+    if s in ("1","true","yes","on","oui","y"):
+        return True
+    if s in ("0","false","no","off","non",""):
+        return False
+    return False
+
+RG_COLUMNS = [
+    "rg_enabled", "rg_rate", "rg_total_operation", "rg_present_ttc",
+    "rg_due_date_iso", "reception_date", "dgd_reminder_days",
+    "rg_liberee", "rg_liberee_date", "show_rg_line", "rg_note",
+    "rg_remaining_ttc",
+]
+
+def _fmt_float(val):
+    try:
+        f = float(val)
+    except Exception:
+        return ""
+    return f"{f:.2f}"
+
 def _first(doc, names, default=None):
     for n in names:
         for k in (n,n.lower(),n.upper(),n.title()):
@@ -328,6 +354,45 @@ def main(argv=None):
         client=_first(doc,["client_nom","client","customer","client_name","raison_sociale"],"")
         total_ttc=_to_float(_first(doc,["total_ttc","montant_ttc","ttc_total","ttc"],0.0))
         meta[numero]={"type":"SITU" if is_situ else "SIMPLE","client":client,"ttc":total_ttc}
+
+        rg_calc={}
+        if hasattr(app, "compute_situation_amounts"):
+            try:
+                rg_calc = app.compute_situation_amounts(dict(doc))  # type: ignore
+            except Exception:
+                rg_calc={}
+
+        rg_rate=_to_float(doc.get("rg_rate") or doc.get("retenue_garantie_pct"))
+        rg_enabled=_to_bool(doc.get("rg_enabled")) or (rg_rate > 0.0)
+        rg_total=_to_float(doc.get("rg_total_operation") or rg_calc.get("rg_total_operation"))
+        rg_present=_to_float(doc.get("rg_present_ttc") or rg_calc.get("rg_present_ttc"))
+        rg_remaining=_to_float(doc.get("rg_remaining_ttc") or rg_calc.get("rg_remaining_ttc"))
+        rg_due=_maybe_iso(doc.get("rg_due_date_iso") or rg_calc.get("rg_due_date_iso"))
+        reception=_maybe_iso(doc.get("reception_date") or doc.get("pv_reception_date_iso"))
+        reminder_raw=doc.get("dgd_reminder_days")
+        try:
+            reminder_days=str(int(float(reminder_raw))) if reminder_raw not in (None,"") else ""
+        except Exception:
+            reminder_days=""
+        rg_lib=_to_bool(doc.get("rg_liberee"))
+        rg_lib_date=_maybe_iso(doc.get("rg_liberee_date"))
+        show_line=_to_bool(doc.get("show_rg_line"))
+        rg_note=str(doc.get("rg_note") or "").replace("\n"," ").strip()
+
+        meta[numero].update({
+            "rg_enabled": "1" if rg_enabled else "0",
+            "rg_rate": _fmt_float(rg_rate) if rg_rate or rg_enabled else "",
+            "rg_total_operation": _fmt_float(rg_total) if rg_total else ("0.00" if rg_enabled else ""),
+            "rg_present_ttc": _fmt_float(rg_present) if rg_present else ("0.00" if rg_enabled else ""),
+            "rg_due_date_iso": rg_due or "",
+            "reception_date": reception or "",
+            "dgd_reminder_days": reminder_days,
+            "rg_liberee": "1" if rg_lib else "0",
+            "rg_liberee_date": rg_lib_date or "",
+            "show_rg_line": "1" if show_line else "0",
+            "rg_note": rg_note,
+            "rg_remaining_ttc": _fmt_float(rg_remaining) if rg_remaining else ("0.00" if rg_enabled else ""),
+        })
         flags=[]
 
         # doc journal
@@ -435,14 +500,15 @@ def main(argv=None):
         bil_per = os.path.join(os.path.dirname(bilan_csv),  "bilan_read_period.csv")
         with open(led_per,"w",newline="",encoding="utf-8") as lf2, open(bil_per,"w",newline="",encoding="utf-8") as bf2:
             lw2=csv.writer(lf2); bw2=csv.writer(bf2)
-            lw2.writerow(["doc_numero","type","client","date","montant","mode","label","child_doc"])
-            bw2.writerow(["doc_numero","type","client","ttc","encaissé_periode","encaissé_total_au_to","restant_au_to","flags"])
+            lw2.writerow(["doc_numero","type","client","date","montant","mode","label","child_doc"] + RG_COLUMNS)
+            bw2.writerow(["doc_numero","type","client","ttc","encaissé_periode","encaissé_total_au_to","restant_au_to","flags"] + RG_COLUMNS)
             for numero,lst in entries.items():
                 m=meta.get(numero,{"type":"", "client":"", "ttc":0.0})
                 # lignes de la période
                 per_rows=[x for x in lst if _in_range(x.get("date",""), dfrom, dto)]
                 for x in sorted(per_rows, key=lambda x: (x["date"] or "", x["montant"])):
-                    lw2.writerow([numero, m["type"], m["client"], x["date"], f"{x['montant']:.2f}", x["mode"], x["label"], x.get("child_doc","")])
+                    rg_values=[m.get(col, "") for col in RG_COLUMNS]
+                    lw2.writerow([numero, m["type"], m["client"], x["date"], f"{x['montant']:.2f}", x["mode"], x["label"], x.get("child_doc","")] + rg_values)
                 paid_per = round(sum(x["montant"] for x in per_rows),2)
                 # total cumulé jusqu'à dto
                 if dto:
@@ -453,18 +519,20 @@ def main(argv=None):
                 ttc=float(m["ttc"] or 0.0)
                 restant_to = max(ttc - paid_cum, 0.0)
                 flags = flags_map.get(numero, "ok")
-                bw2.writerow([numero, m["type"], m["client"], f"{ttc:.2f}", f"{paid_per:.2f}", f"{paid_cum:.2f}", f"{restant_to:.2f}", flags])
+                rg_values=[m.get(col, "") for col in RG_COLUMNS]
+                bw2.writerow([numero, m["type"], m["client"], f"{ttc:.2f}", f"{paid_per:.2f}", f"{paid_cum:.2f}", f"{restant_to:.2f}", flags] + rg_values)
 
     # Write outputs + overpaid flag
     with open(ledger_csv,"w",newline="",encoding="utf-8") as lf, open(bilan_csv,"w",newline="",encoding="utf-8") as bf:
         lw=csv.writer(lf); bw=csv.writer(bf)
-        lw.writerow(["doc_numero","type","client","date","montant","mode","label","child_doc"])
-        bw.writerow(["doc_numero","type","client","ttc","encaissé","restant_du","flags"])
+        lw.writerow(["doc_numero","type","client","date","montant","mode","label","child_doc"] + RG_COLUMNS)
+        bw.writerow(["doc_numero","type","client","ttc","encaissé","restant_du","flags"] + RG_COLUMNS)
 
         for numero,lst in entries.items():
             m=meta.get(numero,{"type":"", "client":"", "ttc":0.0})
             for x in sorted(lst, key=lambda x: (x["date"] or "", x["montant"])):
-                lw.writerow([numero, m["type"], m["client"], x["date"], f"{x['montant']:.2f}", x["mode"], x["label"], x.get("child_doc","")])
+                rg_values=[m.get(col, "") for col in RG_COLUMNS]
+                lw.writerow([numero, m["type"], m["client"], x["date"], f"{x['montant']:.2f}", x["mode"], x["label"], x.get("child_doc","")] + rg_values)
 
         for numero,m in meta.items():
             paid=round(sum(x["montant"] for x in entries.get(numero,[])),2)
@@ -477,7 +545,8 @@ def main(argv=None):
                 except Exception: pass
             flags_str="ok" if not flags or flags==["ok"] else "|".join(flags)
             restant=max(ttc-paid,0.0)
-            bw.writerow([numero, m["type"], m["client"], f"{ttc:.2f}", f"{paid:.2f}", f"{restant:.2f}", flags_str])
+            rg_values=[m.get(col, "") for col in RG_COLUMNS]
+            bw.writerow([numero, m["type"], m["client"], f"{ttc:.2f}", f"{paid:.2f}", f"{restant:.2f}", flags_str] + rg_values)
 
     logging.info("[ledger_dump_plus] OK (SITU dedup by child_doc + PDF scan)")
     logging.info("ledger: %s", ledger_csv)
